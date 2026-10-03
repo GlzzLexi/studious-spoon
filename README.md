@@ -30,14 +30,14 @@ studious-spoon/
 ├── Company/
 │   └── logo.png
 ├── Modules/                  # ReplicatedStorage / Shared Modules
-│   ├── DataStore/            # Session locking, profile wrappers, retry logic
+│   ├── DataStore             # Session locking, profile wrappers, retry logic
 │   ├── ScoringSystem/        # Leaderboards, score multipliers, combo logic
 │   └── ...                   # Utility classes, math helpers, net wrappers
 ├── Server script/            # ServerScriptService
-│   ├── DataStore/            # Database listeners, autosave loops, session handlers
+│   ├── DataStore             # Database listeners, autosave loops, session handlers
 │   ├── ScoringSystem/        # Server-side authority, score validation, awards
 │   └── ...
 └── local script/             # StarterPlayerScripts / StarterGui
-    ├── DataStore/            # UI data bindings, loading screens, local state mirrors
+    ├── DataStore             # UI data bindings, loading screens, local state mirrors
     ├── ScoringSystem/        # HUD renderers, visual popups, animations
     └── ...
