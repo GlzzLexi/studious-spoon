@@ -7,7 +7,7 @@ on:
     paths-ignore:
       - 'README.md'
       - '.github/**'
-
+  workflow_dispatch: 
 jobs:
   update-org-discussion:
     runs-on: ubuntu-latest
@@ -33,33 +33,42 @@ jobs:
           echo "New Title Window: ${TITLE_WINDOW}"
           echo "New Body Window:  ${BODY_WINDOW}"
 
-          # 2. Fetch the GraphQL Node ID of the Org Discussion
-          #    Organization Discussions live inside the org's designated discussion repo,
-          #    so we search across the org's repositories for Discussion #1.
-          DISCUSSION_ID=$(gh api graphql \
-            -F org="$ORG_NAME" \
-            -F number="$DISCUSSION_NUMBER" \
-            -f query='
-              query($org: String!,$number: Int!) {
-                organization(login: $org) {
-                  repositories(first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                    nodes {
-                      discussion(number: $number) {
-                        id
-                        title
-                      }
+          # 2. Get all repository names in the GlzzLexi organization
+          REPOS=$(gh api "orgs/${ORG_NAME}/repos?per_page=100&type=all" --jq '.[].name')
+
+          DISCUSSION_ID=""
+          FOUND_REPO=""
+
+          # Safely check each repo for Discussion #1 (ignoring repos that don't have it)
+          for REPO in $REPOS; do
+            ID=$(gh api graphql \
+              -F owner="$ORG_NAME" \
+              -F name="$REPO" \
+              -F number="$DISCUSSION_NUMBER" \
+              -f query='
+                query($owner: String!, $name: String!,$number: Int!) {
+                  repository(owner: $owner, name:$name) {
+                    discussion(number: $number) {
+                      id
                     }
                   }
                 }
-              }
-            ' --jq '[.data.organization.repositories.nodes[].discussion | select(. != null)][0].id')
+              ' --jq '.data.repository.discussion.id' 2>/dev/null || true)
 
-          if [ -z "$DISCUSSION_ID" ] \vert{}\vert{} [ "$DISCUSSION_ID" = "null" ]; then
-            echo "Error: Could not find Discussion #${DISCUSSION_NUMBER} in Org${ORG_NAME}"
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              DISCUSSION_ID="$ID"
+              FOUND_REPO="$REPO"
+              break
+            fi
+          done
+
+          if [ -z "$DISCUSSION_ID" ]; then
+            echo "Error: Could not find Discussion #${DISCUSSION_NUMBER} in any${ORG_NAME} repo."
+            echo "Make sure your ORG_DISCUSSION_TOKEN has 'repo', 'read:org', and 'write:discussion' scopes!"
             exit 1
           fi
 
-          echo "Found Discussion Node ID: ${DISCUSSION_ID}"
+          echo "Found Discussion #1 inside '${ORG_NAME}/${FOUND_REPO}' (Node ID:${DISCUSSION_ID})"
 
           # 3. Build the new Title and Body
           NEW_TITLE="📢 Project Roadmap & Modular Releases (Target: ${TITLE_WINDOW})"
