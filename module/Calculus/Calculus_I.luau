@@ -313,4 +313,195 @@ end
 -- Finite difference for discrete array data
 local function diffDiscrete(data: { number }, dx: number, index: number?): number | { number }
 	local n = #data
-	if
+	if n < 2 then
+		error("Discrete data requires at least 2 points", 0)
+	end
+
+	local function at(i: number): number
+		if i < 1 or i > n or i % 1 ~= 0 then
+			error(`Index {i} out of bounds [1, {n}]`, 0)
+		end
+		if i == 1 then
+			return (data[2] - data[1]) / dx
+		elseif i == n then
+			return (data[n] - data[n - 1]) / dx
+		else
+			return (data[i + 1] - data[i - 1]) / (2 * dx)
+		end
+	end
+
+	if index ~= nil then
+		return at(index)
+	end
+
+	local out = table.create(n)
+	for i = 1, n do
+		local val = at(i)
+		if not isFinite(val) then
+			error("Result contains NaN or Infinite values", 0)
+		end
+		out[i] = val
+	end
+	return out
+end
+
+-- Composite Simpson's 1/3 Rule for continuous functions: O(h^4) accuracy
+local function integrateContinuous(fn: MathFn, a: number, b: number, intervals: number): number
+	if a == b then
+		return 0
+	end
+	local sign = 1
+	if a > b then
+		a, b = b, a
+		sign = -1
+	end
+
+	local n = math.max(2, math.floor(intervals))
+	if n % 2 ~= 0 then
+		n += 1
+	end
+
+	local h = (b - a) / n
+	local sum = fn(a) + fn(b)
+
+	for i = 1, n - 1 do
+		local x = a + i * h
+		local weight = if i % 2 == 1 then 4 else 2
+		sum += weight * fn(x)
+	end
+
+	return sign * (h / 3) * sum
+end
+
+-- Composite Trapezoidal Rule for discrete array data
+local function integrateDiscrete(data: { number }, dx: number, a: number?, b: number?): number
+	local n = #data
+	if n < 2 then
+		error("Discrete data requires at least 2 points", 0)
+	end
+
+	local iStart = a or 1
+	local iEnd = b or n
+
+	local sign = 1
+	if iStart > iEnd then
+		iStart, iEnd = iEnd, iStart
+		sign = -1
+	end
+
+	if iStart < 1 or iEnd > n or iStart % 1 ~= 0 or iEnd % 1 ~= 0 then
+		error(`Indices [{iStart}, {iEnd}] out of bounds [1, {n}]`, 0)
+	end
+	if iStart == iEnd then
+		return 0
+	end
+
+	local sum = 0.5 * (data[iStart] + data[iEnd])
+	for i = iStart + 1, iEnd - 1 do
+		sum += data[i]
+	end
+
+	return sign * sum * dx
+end
+
+--------------------------------------------------------------------------------
+
+local function build(target: Target, dx: number, step: number, intervals: number): Solver
+	local batch = isBatchMap(target)
+
+	local function entries(): { [string]: TargetItem }
+		if batch then
+			return target :: { [string]: TargetItem }
+		end
+		return { _single = target :: TargetItem }
+	end
+
+	local function run(job: (item: TargetItem) -> any): Result
+		local values: { [string]: any } = {}
+		local failed: { [string]: string } = {}
+
+		for name, item in entries() do
+			local ok, res = pcall(function()
+				if dx <= 0 or not isFinite(dx) then
+					error("Spacing 'dx' must be a positive finite number", 0)
+				end
+				local val = job(item)
+				if type(val) == "number" and not isFinite(val) then
+					error("Result is NaN or Infinite", 0)
+				end
+				return val
+			end)
+
+			if ok then
+				values[name] = res
+			else
+				failed[name] = tostring(res)
+			end
+		end
+
+		if not batch then
+			return {
+				ok = failed._single == nil,
+				value = values._single,
+				error = failed._single,
+			}
+		end
+
+		local hasFailures = next(failed) ~= nil
+		return {
+			ok = not hasFailures,
+			value = values,
+			failed = if hasFailures then failed else nil,
+		}
+	end
+
+	local solver: Solver = {
+		Step = function(_, h: number)
+			return build(target, dx, math.max(1e-12, math.abs(h)), intervals)
+		end,
+
+		Intervals = function(_, n: number)
+			local even = math.max(2, math.floor(n))
+			if even % 2 ~= 0 then
+				even += 1
+			end
+			return build(target, dx, step, even)
+		end,
+
+		Differential = function(_, x: number?)
+			return run(function(item: TargetItem)
+				if type(item) == "function" then
+					if x == nil or not isFinite(x) then
+						error("Continuous Differential requires a finite number 'x'", 0)
+					end
+					return diffContinuous(item, x, step)
+				elseif isDiscreteArray(item) then
+					return diffDiscrete(item :: { number }, dx, x)
+				else
+					error("Invalid target: expected function or array of numbers", 0)
+				end
+			end)
+		end,
+
+		Integral = function(_, a: number?, b: number?)
+			return run(function(item: TargetItem)
+				if type(item) == "function" then
+					if a == nil or b == nil or not isFinite(a) or not isFinite(b) then
+						error("Continuous Integral requires finite bounds 'a' and 'b'", 0)
+					end
+					return integrateContinuous(item, a, b, intervals)
+				elseif isDiscreteArray(item) then
+					return integrateDiscrete(item :: { number }, dx, a, b)
+				else
+					error("Invalid target: expected function or array of numbers", 0)
+				end
+			end)
+		end,
+	}
+
+	return solver
+end
+
+return function(target: Target, dx: number?): Solver
+	return build(target, dx or 1, 1e-5, 100)
+end
