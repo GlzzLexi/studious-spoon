@@ -32,46 +32,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. Fetch current Discussion #1 state safely via GraphQL
           echo "Fetching Discussion #${DISCUSSION_NUMBER}..."
-          FETCH_QUERY='query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              discussion(number: $number) {
-                id
-                body
-              }
-            }
-          }'
-          
-          FETCH_PAYLOAD=$(jq -n \
-            --arg owner "$ORG_NAME" \
-            --arg name "$REPO_NAME" \
-            --argjson number "$DISCUSSION_NUMBER" \
-            '{query: "'"$FETCH_QUERY"'", variables: {owner: $owner, name: $name, number: $number}}')
 
-          DISCUSSION_DATA=$(gh api graphql --input - <<< "$FETCH_PAYLOAD" --jq '.data.repository.discussion' 2>/dev/null || true)
+          # Safe GraphQL query without string concatenation
+          DISCUSSION_DATA=$(gh api graphql \
+            -F owner="$ORG_NAME" \
+            -F name="$REPO_NAME" \
+            -F number="$DISCUSSION_NUMBER" \
+            -f query='
+              query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  discussion(number: $number) {
+                    id
+                    body
+                  }
+                }
+              }
+            ' --jq '.data.repository.discussion' 2>/dev/null || true)
 
           if [ -z "$DISCUSSION_DATA" ] || [ "$DISCUSSION_DATA" = "null" ]; then
             echo "::error::Could not find Discussion #${DISCUSSION_NUMBER} in ${ORG_NAME}/${REPO_NAME}."
             exit 1
           fi
 
-          DISCUSSION_ID=$(echo "$DISCUSSION_DATA" | jq -r '.id')
-          CURRENT_BODY=$(echo "$DISCUSSION_DATA" | jq -r '.body')
+          export DISCUSSION_ID=$(echo "$DISCUSSION_DATA" | jq -r '.id')
+          export CURRENT_BODY=$(echo "$DISCUSSION_DATA" | jq -r '.body')
+          export CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git log -1 --name-only --pretty="" 2>/dev/null || echo "")
+          export EVENT_NAME="${{ github.event_name }}"
 
-          # 2. Extract changed files from the current or latest commit
-          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git log -1 --name-only --pretty="" 2>/dev/null || echo "")
-
-          # 3. Process status, changes, and delays through Python
-          EVAL_RESULT=$(python3 - <<EOF
+          # Safely read inputs via os.environ to avoid triple-quote syntax blowups
+          EVAL_RESULT=$(python3 - <<'EOF'
           import os, re, json
           from datetime import datetime
 
-          current_body = """$CURRENT_BODY"""
-          changed_raw = """$CHANGED_FILES""".strip().splitlines()
-          event_name = "${{ github.event_name }}"
+          current_body = os.environ.get("CURRENT_BODY", "")
+          changed_raw = os.environ.get("CHANGED_FILES", "").strip().splitlines()
+          event_name = os.environ.get("EVENT_NAME", "")
 
-          # Normalized case-insensitive roots to track
           target_roots = ("modules", "server script", "local script")
 
           matched_changes = []
@@ -84,7 +81,7 @@ jobs:
 
           has_qualifying_code_push = (event_name == "push" and len(matched_changes) > 0)
 
-          # Inspect previous target end date
+          # Parse target date
           date_match = re.search(r"Target Dates:.*?[–-]\s*([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)", current_body)
           is_expired = False
           if date_match:
@@ -100,20 +97,18 @@ jobs:
                   except ValueError:
                       pass
 
-          # Derive feature focus from changed file paths if available
+          # Detect subcomponents
           detected_components = set()
           for path in matched_changes:
               parts = path.split('/')
               if len(parts) > 1:
                   detected_components.add(parts[1])
 
-          focus_text = ""
           if detected_components:
               focus_text = f"Active changes recently touched: {', '.join(sorted(detected_components))}. Finalizing unit tests and client/server validation."
           else:
               focus_text = "Polishing core data handlers, network wrappers, and gameplay/state loops before release."
 
-          # If deadline passed on schedule and no qualifying push landed
           needs_delay_notice = (is_expired and not has_qualifying_code_push)
 
           print(json.dumps({
@@ -125,23 +120,18 @@ jobs:
           )
 
           NEEDS_DELAY=$(echo "$EVAL_RESULT" | jq -r '.needs_delay')
-          HAS_PUSH=$(echo "$EVAL_RESULT" | jq -r '.has_push')
           DYNAMIC_FOCUS=$(echo "$EVAL_RESULT" | jq -r '.focus')
 
-          # 4. Compute +5 to +7 release window
           SHORT_START=$(date -d "+5 days" +"%b %-d")
           SHORT_END=$(date -d "+7 days" +"%b %-d")
           LONG_START=$(date -d "+5 days" +"%B %-d")
           LONG_END=$(date -d "+7 days" +"%B %-d, %Y")
 
-          TITLE_WINDOW="${SHORT_START} – ${SHORT_END}"
-          BODY_WINDOW="${LONG_START} – ${LONG_END}"
-          NEW_TITLE="📢 Project Roadmap & Modular Releases (Target: ${TITLE_WINDOW})"
+          export NEW_TITLE="📢 Project Roadmap & Modular Releases (Target: ${SHORT_START} – ${SHORT_END})"
 
-          # 5. Build delay notice callout
           DELAY_BLOCK=""
           if [ "$NEEDS_DELAY" = "true" ]; then
-            echo "Deadline passed with no new module commits. Applying delay notice..."
+            echo "Applying delay notice..."
             DELAY_BLOCK="> [!WARNING]
 > ### ⏳ Schedule Adjustment & Status Update
 > Due to active debugging, technical constraints, or bandwidth adjustments, the previous release target has been pushed back. Development is actively ongoing across our modular components, and updates will ship as soon as stability verification passes.
@@ -149,8 +139,7 @@ jobs:
 "
           fi
 
-          # 6. Compose the complete markdown body
-          NEW_BODY="${DELAY_BLOCK}Hey everyone! 👋
+          export NEW_BODY="${DELAY_BLOCK}Hey everyone! 👋
 
 Welcome to **studious-spoon**. As part of building out the foundation for **GlzzLexi Studios**, I’ll be periodically rolling out open-source, modular Luau tools and starter systems straight from our development pipeline.
 
@@ -160,29 +149,28 @@ Because I’m balancing production and independent development, updates will shi
 - **Philosophy:** Clean, plug-and-play code that you can drop into \`ReplicatedStorage\` or \`ServerScriptService\` with zero bloat.
 
 ### 🗓️ Next Release Window
-- **Target Dates:** **${BODY_WINDOW}** *(subject to active development bandwidth)*
+- **Target Dates:** **${LONG_START} – ${LONG_END}** *(subject to active development bandwidth)*
 - **Focus:** ${DYNAMIC_FOCUS}
 
 Drop your suggestions or feedback below on what types of modular tools or game systems you’d like to see prioritized next! 🚀"
 
-          # 7. Execute Mutation safely with escaped variables
-          MUTATION_QUERY='mutation($id: ID!, $title: String!, $body: String!) {
-            updateDiscussion(input: {
-              discussionId: $id,
-              title: $title,
-              body: $body
-            }) {
-              discussion {
-                url
+          # Use gh api graphql flags directly to avoid bash quoting crashes
+          gh api graphql \
+            -F id="$DISCUSSION_ID" \
+            -F title="$NEW_TITLE" \
+            -F body="$NEW_BODY" \
+            -f query='
+              mutation($id: ID!, $title: String!, $body: String!) {
+                updateDiscussion(input: {
+                  discussionId: $id,
+                  title: $title,
+                  body: $body
+                }) {
+                  discussion {
+                    url
+                  }
+                }
               }
-            }
-          }'
+            '
 
-          FINAL_PAYLOAD=$(jq -n \
-            --arg id "$DISCUSSION_ID" \
-            --arg title "$NEW_TITLE" \
-            --arg body "$NEW_BODY" \
-            '{query: "'"$MUTATION_QUERY"'", variables: {id: $id, title: $title, body: $body}}')
-
-          gh api graphql --input - <<< "$FINAL_PAYLOAD"
           echo "Discussion #${DISCUSSION_NUMBER} successfully synchronized."
