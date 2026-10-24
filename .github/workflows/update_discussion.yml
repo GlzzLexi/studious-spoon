@@ -7,7 +7,11 @@ on:
     paths-ignore:
       - 'README.md'
       - '.github/**'
-  workflow_dispatch: 
+      - 'Company/**'
+  schedule:
+    - cron: '0 0 * * *' # Daily check at 08:00 AM Asia/Manila (00:00 UTC)
+  workflow_dispatch:
+
 jobs:
   update-org-discussion:
     runs-on: ubuntu-latest
@@ -15,96 +19,170 @@ jobs:
       GH_TOKEN: ${{ secrets.ORG_DISCUSSION_TOKEN }}
       TZ: 'Asia/Manila'
       ORG_NAME: "GlzzLexi"
-      DISCUSSION_NUMBER: "1"
+      REPO_NAME: "studious-spoon"
+      DISCUSSION_NUMBER: 1
 
     steps:
-      - name: Calculate Next Release Window & Update Org Discussion
+      - name: Checkout Repository History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Evaluate Activity & Update Discussion
         run: |
-          # 1. Calculate the +5 to +7 day window (e.g., Oct 14 -> Oct 19 - Oct 21)
-          SHORT_START=$(date -d "+5 days" +"%b %-d")
-          SHORT_END=$(date -d "+7 days" +"%b %-d")
+          set -euo pipefail
+
+          # 1. Fetch current Discussion #1 state safely via GraphQL
+          echo "Fetching Discussion #${DISCUSSION_NUMBER}..."
+          FETCH_QUERY='query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              discussion(number: $number) {
+                id
+                body
+              }
+            }
+          }'
           
-          LONG_START=$(date -d "+5 days" +"%B %-d")
-          LONG_END=$(date -d "+7 days" +"%B %-d, %Y")
+          FETCH_PAYLOAD=$(jq -n \
+            --arg owner "$ORG_NAME" \
+            --arg name "$REPO_NAME" \
+            --argjson number "$DISCUSSION_NUMBER" \
+            '{query: "'"$FETCH_QUERY"'", variables: {owner: $owner, name: $name, number: $number}}')
 
-          TITLE_WINDOW="${SHORT_START} –${SHORT_END}"
-          BODY_WINDOW="${LONG_START} –${LONG_END}"
+          DISCUSSION_DATA=$(gh api graphql --input - <<< "$FETCH_PAYLOAD" --jq '.data.repository.discussion' 2>/dev/null || true)
 
-          echo "New Title Window: ${TITLE_WINDOW}"
-          echo "New Body Window:  ${BODY_WINDOW}"
-
-          # 2. Get all repository names in the GlzzLexi organization
-          REPOS=$(gh api "orgs/${ORG_NAME}/repos?per_page=100&type=all" --jq '.[].name')
-
-          DISCUSSION_ID=""
-          FOUND_REPO=""
-
-          # Safely check each repo for Discussion #1 (ignoring repos that don't have it)
-          for REPO in $REPOS; do
-            ID=$(gh api graphql \
-              -F owner="$ORG_NAME" \
-              -F name="$REPO" \
-              -F number="$DISCUSSION_NUMBER" \
-              -f query='
-                query($owner: String!, $name: String!,$number: Int!) {
-                  repository(owner: $owner, name:$name) {
-                    discussion(number: $number) {
-                      id
-                    }
-                  }
-                }
-              ' --jq '.data.repository.discussion.id' 2>/dev/null || true)
-
-            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
-              DISCUSSION_ID="$ID"
-              FOUND_REPO="$REPO"
-              break
-            fi
-          done
-
-          if [ -z "$DISCUSSION_ID" ]; then
-            echo "Error: Could not find Discussion #${DISCUSSION_NUMBER} in any${ORG_NAME} repo."
-            echo "Make sure your ORG_DISCUSSION_TOKEN has 'repo', 'read:org', and 'write:discussion' scopes!"
+          if [ -z "$DISCUSSION_DATA" ] || [ "$DISCUSSION_DATA" = "null" ]; then
+            echo "::error::Could not find Discussion #${DISCUSSION_NUMBER} in ${ORG_NAME}/${REPO_NAME}."
             exit 1
           fi
 
-          echo "Found Discussion #1 inside '${ORG_NAME}/${FOUND_REPO}' (Node ID:${DISCUSSION_ID})"
+          DISCUSSION_ID=$(echo "$DISCUSSION_DATA" | jq -r '.id')
+          CURRENT_BODY=$(echo "$DISCUSSION_DATA" | jq -r '.body')
 
-          # 3. Build the new Title and Body
+          # 2. Extract changed files from the current or latest commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git log -1 --name-only --pretty="" 2>/dev/null || echo "")
+
+          # 3. Process status, changes, and delays through Python
+          EVAL_RESULT=$(python3 - <<EOF
+          import os, re, json
+          from datetime import datetime
+
+          current_body = """$CURRENT_BODY"""
+          changed_raw = """$CHANGED_FILES""".strip().splitlines()
+          event_name = "${{ github.event_name }}"
+
+          # Normalized case-insensitive roots to track
+          target_roots = ("modules", "server script", "local script")
+
+          matched_changes = []
+          for file_path in changed_raw:
+              lower_path = file_path.lower()
+              for root in target_roots:
+                  if lower_path.startswith(root + "/"):
+                      matched_changes.append(file_path)
+                      break
+
+          has_qualifying_code_push = (event_name == "push" and len(matched_changes) > 0)
+
+          # Inspect previous target end date
+          date_match = re.search(r"Target Dates:.*?[–-]\s*([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)", current_body)
+          is_expired = False
+          if date_match:
+              raw_date = date_match.group(1).strip()
+              if not re.search(r"\d{4}", raw_date):
+                  raw_date += f", {datetime.now().year}"
+              for fmt in ("%B %d, %Y", "%b %d, %Y"):
+                  try:
+                      deadline = datetime.strptime(raw_date, fmt)
+                      if datetime.now().date() > deadline.date():
+                          is_expired = True
+                      break
+                  except ValueError:
+                      pass
+
+          # Derive feature focus from changed file paths if available
+          detected_components = set()
+          for path in matched_changes:
+              parts = path.split('/')
+              if len(parts) > 1:
+                  detected_components.add(parts[1])
+
+          focus_text = ""
+          if detected_components:
+              focus_text = f"Active changes recently touched: {', '.join(sorted(detected_components))}. Finalizing unit tests and client/server validation."
+          else:
+              focus_text = "Polishing core data handlers, network wrappers, and gameplay/state loops before release."
+
+          # If deadline passed on schedule and no qualifying push landed
+          needs_delay_notice = (is_expired and not has_qualifying_code_push)
+
+          print(json.dumps({
+              "needs_delay": needs_delay_notice,
+              "has_push": has_qualifying_code_push,
+              "focus": focus_text
+          }))
+          EOF
+          )
+
+          NEEDS_DELAY=$(echo "$EVAL_RESULT" | jq -r '.needs_delay')
+          HAS_PUSH=$(echo "$EVAL_RESULT" | jq -r '.has_push')
+          DYNAMIC_FOCUS=$(echo "$EVAL_RESULT" | jq -r '.focus')
+
+          # 4. Compute +5 to +7 release window
+          SHORT_START=$(date -d "+5 days" +"%b %-d")
+          SHORT_END=$(date -d "+7 days" +"%b %-d")
+          LONG_START=$(date -d "+5 days" +"%B %-d")
+          LONG_END=$(date -d "+7 days" +"%B %-d, %Y")
+
+          TITLE_WINDOW="${SHORT_START} – ${SHORT_END}"
+          BODY_WINDOW="${LONG_START} – ${LONG_END}"
           NEW_TITLE="📢 Project Roadmap & Modular Releases (Target: ${TITLE_WINDOW})"
 
-          read -r -d '' NEW_BODY << EOF || true
-          Hey everyone! 👋
+          # 5. Build delay notice callout
+          DELAY_BLOCK=""
+          if [ "$NEEDS_DELAY" = "true" ]; then
+            echo "Deadline passed with no new module commits. Applying delay notice..."
+            DELAY_BLOCK="> [!WARNING]
+> ### ⏳ Schedule Adjustment & Status Update
+> Due to active debugging, technical constraints, or bandwidth adjustments, the previous release target has been pushed back. Development is actively ongoing across our modular components, and updates will ship as soon as stability verification passes.
 
-          Welcome to **studious-spoon**. As part of building out the foundation for **GlzzLexi Studios**, I’ll be periodically rolling out open-source, modular Luau tools and starter systems straight from our development pipeline.
+"
+          fi
 
-          ### 📦 Release Cadence
-          Because I’m balancing production and independent development, updates will ship incrementally:
-          - **Scope:** Expect **1 to 2 focused, production-ready modules** per release batch (e.g., custom state managers, network wrappers, or gameplay controller templates).
-          - **Philosophy:** Clean, plug-and-play code that you can drop into \`ReplicatedStorage\` or \`ServerScriptService\` with zero bloat.
+          # 6. Compose the complete markdown body
+          NEW_BODY="${DELAY_BLOCK}Hey everyone! 👋
 
-          ### 🗓️ Next Release Window
-          - **Target Dates:** **${BODY_WINDOW}** *(subject to active development bandwidth)*
-          - **Focus:** Polishing the core data handlers and initial scoring/state loops before pushing them to \`main\`.
+Welcome to **studious-spoon**. As part of building out the foundation for **GlzzLexi Studios**, I’ll be periodically rolling out open-source, modular Luau tools and starter systems straight from our development pipeline.
 
-          Drop your suggestions or feedback below on what types of modular tools or game systems you’d like to see prioritized next! 🚀
-          EOF
+### 📦 Release Cadence
+Because I’m balancing production and independent development, updates will ship incrementally:
+- **Scope:** Expect **1 to 2 focused, production-ready modules** per release batch (e.g., custom state managers, network wrappers, or gameplay controller templates).
+- **Philosophy:** Clean, plug-and-play code that you can drop into \`ReplicatedStorage\` or \`ServerScriptService\` with zero bloat.
 
-          # 4. Update the Org Discussion via GraphQL Mutation
-          gh api graphql \
-            -f discussionId="$DISCUSSION_ID" \
-            -f title="$NEW_TITLE" \
-            -f body="$NEW_BODY" \
-            -f query='
-              mutation($discussionId: ID!, $title: String!,$body: String!) {
-                updateDiscussion(input: {
-                  discussionId: $discussionId,
-                  title: $title,
-                  body: $body
-                }) {
-                  discussion {
-                    url
-                  }
-                }
+### 🗓️ Next Release Window
+- **Target Dates:** **${BODY_WINDOW}** *(subject to active development bandwidth)*
+- **Focus:** ${DYNAMIC_FOCUS}
+
+Drop your suggestions or feedback below on what types of modular tools or game systems you’d like to see prioritized next! 🚀"
+
+          # 7. Execute Mutation safely with escaped variables
+          MUTATION_QUERY='mutation($id: ID!, $title: String!, $body: String!) {
+            updateDiscussion(input: {
+              discussionId: $id,
+              title: $title,
+              body: $body
+            }) {
+              discussion {
+                url
               }
-            '
+            }
+          }'
+
+          FINAL_PAYLOAD=$(jq -n \
+            --arg id "$DISCUSSION_ID" \
+            --arg title "$NEW_TITLE" \
+            --arg body "$NEW_BODY" \
+            '{query: "'"$MUTATION_QUERY"'", variables: {id: $id, title: $title, body: $body}}')
+
+          gh api graphql --input - <<< "$FINAL_PAYLOAD"
+          echo "Discussion #${DISCUSSION_NUMBER} successfully synchronized."
