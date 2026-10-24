@@ -35,7 +35,6 @@ def send_graphql(query, variables):
         print(f"::error::HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')}")
         sys.exit(1)
 
-# 1. Fetch current discussion content
 fetch_query = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -55,9 +54,8 @@ if not repo_obj or not repo_obj.get("discussion"):
 discussion_id = repo_obj["discussion"]["id"]
 current_body = repo_obj["discussion"].get("body", "")
 
-# 2. Inspect git diff for tracked folders (case-insensitive)
 changed_files = []
-if event_name == "push":
+if event_name in ("push", "workflow_dispatch"):
     for cmd in [
         ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
         ["git", "log", "-1", "--name-only", "--pretty="]
@@ -87,41 +85,60 @@ for path in changed_files:
 
 has_qualifying_push = (len(matched_changes) > 0)
 
-# If pushed, but nothing in tracked Luau folders was modified, do not alter discussion
 if event_name == "push" and not has_qualifying_push:
     print("Push detected, but no changes in Modules, Server script, or local script. Skipping.")
     sys.exit(0)
 
-# 3. Time & Window Evaluation (Asia/Manila UTC+8)
 manila_tz = timezone(timedelta(hours=8))
 now = datetime.now(manila_tz)
 today = now.date()
 
-date_pattern = r"Target Dates:.*?[–—\-]\s*\*?([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)\*?"
+date_pattern = r"Target Dates:.*?\*?([A-Za-z]+\s+\d{1,2})\*?\s*[–—\-]\s*\*?([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)\*?"
 date_match = re.search(date_pattern, current_body)
 
+parsed_start = None
+parsed_end = None
 is_expired = False
+is_early = False
+
 if date_match:
-    raw_date = date_match.group(1).strip()
-    if not re.search(r"\d{4}", raw_date):
-        raw_date += f", {now.year}"
+    raw_start = date_match.group(1).strip()
+    raw_end = date_match.group(2).strip()
+
+    year = now.year
+    year_match = re.search(r"\d{4}", raw_end)
+    if year_match:
+        year = int(year_match.group(0))
+    else:
+        raw_end += f", {year}"
+
+    raw_start += f", {year}"
+
     for fmt in ("%B %d, %Y", "%b %d, %Y"):
         try:
-            deadline = datetime.strptime(raw_date, fmt).date()
-            if today > deadline:
-                is_expired = True
-            break
+            if not parsed_start:
+                parsed_start = datetime.strptime(raw_start, fmt).date()
         except ValueError:
-            continue
+            pass
+        try:
+            if not parsed_end:
+                parsed_end = datetime.strptime(raw_end, fmt).date()
+        except ValueError:
+            pass
 
-# Guard against infinite sliding window on scheduled runs
+    if parsed_end and today > parsed_end:
+        is_expired = True
+
+    if parsed_start and has_qualifying_push and today < parsed_start:
+        is_early = True
+
+# If scheduled run and release deadline hasn't passed, do nothing
 if event_name == "schedule" and not is_expired:
     print("Scheduled check: Current release window is still active. No update required.")
     sys.exit(0)
 
 needs_delay = (is_expired and not has_qualifying_push)
 
-# 4. Formulate New Window (+5 to +7 days)
 start_date = now + timedelta(days=5)
 end_date = now + timedelta(days=7)
 
@@ -134,9 +151,17 @@ if detected_components:
 else:
     focus_text = "Polishing core data handlers, network wrappers, and gameplay/state loops before release."
 
-delay_block = ""
-if needs_delay:
-    delay_block = (
+notice_block = ""
+if is_early:
+    notice_block = (
+        "> [!TIP]\n"
+        "> ### ⚡ Early Release Notice\n"
+        "> Due to unexpected circumstances—rapid development progress, smooth integration passes, and early system validation—we were able to complete and ship this batch ahead of schedule!\n"
+        ">\n"
+        "> The latest modular updates are live on `main`. Below is the next upcoming release window.\n\n"
+    )
+elif needs_delay:
+    notice_block = (
         "> [!WARNING]\n"
         "> ### ⏳ Schedule Adjustment & Status Update\n"
         "> Due to active debugging, technical constraints, or bandwidth adjustments, the previous milestone window has been adjusted. Development remains active, and modules will land once stability checks pass.\n\n"
@@ -144,7 +169,7 @@ if needs_delay:
 
 new_title = f"📢 Project Roadmap & Modular Releases (Target: {title_window})"
 new_body = (
-    f"{delay_block}Hey everyone! 👋\n\n"
+    f"{notice_block}Hey everyone! 👋\n\n"
     f"Welcome to **studious-spoon**. As part of building out the foundation for **GlzzLexi Studios**, I’ll be periodically rolling out open-source, modular Luau tools and starter systems straight from our development pipeline.\n\n"
     f"### 📦 Release Cadence\n"
     f"Because I’m balancing production and independent development, updates will ship incrementally:\n"
@@ -156,7 +181,6 @@ new_body = (
     f"Drop your suggestions or feedback below on what types of modular tools or game systems you’d like to see prioritized next! 🚀"
 )
 
-# 5. Execute GraphQL Mutation
 mutation_query = """
 mutation($id: ID!, $title: String!, $body: String!) {
   updateDiscussion(input: {
