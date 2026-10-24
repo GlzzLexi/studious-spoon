@@ -28,4 +28,4 @@ jobs:
           fetch-depth: 2
 
       - name: Run Discussion Synchronizer
-        run: python3 .github/scripts/update_discussion.py
+        run: python3 .github/workflows/update_discussion.py
