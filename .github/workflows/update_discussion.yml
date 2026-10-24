@@ -9,7 +9,7 @@ on:
       - '.github/**'
       - 'Company/**'
   schedule:
-    - cron: '0 0 * * *' # Daily check at 08:00 AM Asia/Manila (00:00 UTC)
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,160 +17,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.ORG_DISCUSSION_TOKEN }}
-      TZ: 'Asia/Manila'
       ORG_NAME: "GlzzLexi"
       REPO_NAME: "studious-spoon"
-      DISCUSSION_NUMBER: 1
+      DISCUSSION_NUMBER: "1"
 
     steps:
-      - name: Checkout Repository History
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Evaluate Activity & Update Discussion
-        run: |
-          set -euo pipefail
-
-          echo "Fetching Discussion #${DISCUSSION_NUMBER}..."
-
-          # Safe GraphQL query without string concatenation
-          DISCUSSION_DATA=$(gh api graphql \
-            -F owner="$ORG_NAME" \
-            -F name="$REPO_NAME" \
-            -F number="$DISCUSSION_NUMBER" \
-            -f query='
-              query($owner: String!, $name: String!, $number: Int!) {
-                repository(owner: $owner, name: $name) {
-                  discussion(number: $number) {
-                    id
-                    body
-                  }
-                }
-              }
-            ' --jq '.data.repository.discussion' 2>/dev/null || true)
-
-          if [ -z "$DISCUSSION_DATA" ] || [ "$DISCUSSION_DATA" = "null" ]; then
-            echo "::error::Could not find Discussion #${DISCUSSION_NUMBER} in ${ORG_NAME}/${REPO_NAME}."
-            exit 1
-          fi
-
-          export DISCUSSION_ID=$(echo "$DISCUSSION_DATA" | jq -r '.id')
-          export CURRENT_BODY=$(echo "$DISCUSSION_DATA" | jq -r '.body')
-          export CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git log -1 --name-only --pretty="" 2>/dev/null || echo "")
-          export EVENT_NAME="${{ github.event_name }}"
-
-          # Safely read inputs via os.environ to avoid triple-quote syntax blowups
-          EVAL_RESULT=$(python3 - <<'EOF'
-          import os, re, json
-          from datetime import datetime
-
-          current_body = os.environ.get("CURRENT_BODY", "")
-          changed_raw = os.environ.get("CHANGED_FILES", "").strip().splitlines()
-          event_name = os.environ.get("EVENT_NAME", "")
-
-          target_roots = ("modules", "server script", "local script")
-
-          matched_changes = []
-          for file_path in changed_raw:
-              lower_path = file_path.lower()
-              for root in target_roots:
-                  if lower_path.startswith(root + "/"):
-                      matched_changes.append(file_path)
-                      break
-
-          has_qualifying_code_push = (event_name == "push" and len(matched_changes) > 0)
-
-          # Parse target date
-          date_match = re.search(r"Target Dates:.*?[–-]\s*([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)", current_body)
-          is_expired = False
-          if date_match:
-              raw_date = date_match.group(1).strip()
-              if not re.search(r"\d{4}", raw_date):
-                  raw_date += f", {datetime.now().year}"
-              for fmt in ("%B %d, %Y", "%b %d, %Y"):
-                  try:
-                      deadline = datetime.strptime(raw_date, fmt)
-                      if datetime.now().date() > deadline.date():
-                          is_expired = True
-                      break
-                  except ValueError:
-                      pass
-
-          # Detect subcomponents
-          detected_components = set()
-          for path in matched_changes:
-              parts = path.split('/')
-              if len(parts) > 1:
-                  detected_components.add(parts[1])
-
-          if detected_components:
-              focus_text = f"Active changes recently touched: {', '.join(sorted(detected_components))}. Finalizing unit tests and client/server validation."
-          else:
-              focus_text = "Polishing core data handlers, network wrappers, and gameplay/state loops before release."
-
-          needs_delay_notice = (is_expired and not has_qualifying_code_push)
-
-          print(json.dumps({
-              "needs_delay": needs_delay_notice,
-              "has_push": has_qualifying_code_push,
-              "focus": focus_text
-          }))
-          EOF
-          )
-
-          NEEDS_DELAY=$(echo "$EVAL_RESULT" | jq -r '.needs_delay')
-          DYNAMIC_FOCUS=$(echo "$EVAL_RESULT" | jq -r '.focus')
-
-          SHORT_START=$(date -d "+5 days" +"%b %-d")
-          SHORT_END=$(date -d "+7 days" +"%b %-d")
-          LONG_START=$(date -d "+5 days" +"%B %-d")
-          LONG_END=$(date -d "+7 days" +"%B %-d, %Y")
-
-          export NEW_TITLE="📢 Project Roadmap & Modular Releases (Target: ${SHORT_START} – ${SHORT_END})"
-
-          DELAY_BLOCK=""
-          if [ "$NEEDS_DELAY" = "true" ]; then
-            echo "Applying delay notice..."
-            DELAY_BLOCK="> [!WARNING]
-> ### ⏳ Schedule Adjustment & Status Update
-> Due to active debugging, technical constraints, or bandwidth adjustments, the previous release target has been pushed back. Development is actively ongoing across our modular components, and updates will ship as soon as stability verification passes.
-
-"
-          fi
-
-          export NEW_BODY="${DELAY_BLOCK}Hey everyone! 👋
-
-Welcome to **studious-spoon**. As part of building out the foundation for **GlzzLexi Studios**, I’ll be periodically rolling out open-source, modular Luau tools and starter systems straight from our development pipeline.
-
-### 📦 Release Cadence
-Because I’m balancing production and independent development, updates will ship incrementally:
-- **Scope:** Expect **1 to 2 focused, production-ready modules** per release batch (e.g., custom state managers, network wrappers, or gameplay controller templates).
-- **Philosophy:** Clean, plug-and-play code that you can drop into \`ReplicatedStorage\` or \`ServerScriptService\` with zero bloat.
-
-### 🗓️ Next Release Window
-- **Target Dates:** **${LONG_START} – ${LONG_END}** *(subject to active development bandwidth)*
-- **Focus:** ${DYNAMIC_FOCUS}
-
-Drop your suggestions or feedback below on what types of modular tools or game systems you’d like to see prioritized next! 🚀"
-
-          # Use gh api graphql flags directly to avoid bash quoting crashes
-          gh api graphql \
-            -F id="$DISCUSSION_ID" \
-            -F title="$NEW_TITLE" \
-            -F body="$NEW_BODY" \
-            -f query='
-              mutation($id: ID!, $title: String!, $body: String!) {
-                updateDiscussion(input: {
-                  discussionId: $id,
-                  title: $title,
-                  body: $body
-                }) {
-                  discussion {
-                    url
-                  }
-                }
-              }
-            '
-
-          echo "Discussion #${DISCUSSION_NUMBER} successfully synchronized."
+      - name: Run Discussion Synchronizer
+        run: python3 .github/scripts/update_discussion.py
